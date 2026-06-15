@@ -94,23 +94,121 @@ window.addEventListener('resize', resizeCarts);
    3. AUDIO ENGINE
    ============================================================= */
 
-/**
- * Fade audio element in over `ms` milliseconds.
- * @param {HTMLAudioElement} el
- * @param {number} [ms]
- */
-function fadeIn(el, ms = FADE_MS) {
-  el.volume = 0;
-  const step = 50 / ms;
-  const id = setInterval(() => {
-    if (el.volume + step >= 1) {
-      el.volume = 1;
-      clearInterval(id);
-    } else {
-      el.volume += step;
-    }
-  }, 50);
+/* ---------------------------------------------------------------
+   3a. SHARED AUDIO CONTEXT (pour boucle sans coupure)
+   --------------------------------------------------------------- */
+
+let _sharedAudioCtx = null;
+
+function getAudioCtx() {
+  if (!_sharedAudioCtx || _sharedAudioCtx.state === 'closed') {
+    _sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (_sharedAudioCtx.state === 'suspended') _sharedAudioCtx.resume();
+  return _sharedAudioCtx;
 }
+
+/**
+ * Retourne les bornes de boucle (loopStart, loopEnd, loopLen) en secondes
+ * pour un cart donné, en tenant compte des points de cue.
+ */
+function _glBounds(cartEl) {
+  const dur = cartEl.audioBuffer ? cartEl.audioBuffer.duration : (cartEl.audio.duration || 0);
+  const ls  = (cartEl.cueIn  !== null) ? cartEl.cueIn  * dur : 0;
+  const le  = (cartEl.cueOut !== null) ? cartEl.cueOut * dur : dur;
+  return { ls, le, ll: Math.max(0.001, le - ls) };
+}
+
+/**
+ * Position de lecture actuelle (en secondes depuis le début du buffer)
+ * pour un cart en mode gapless-loop. Retourne audio.currentTime sinon.
+ */
+function glCurrentTime(cartEl) {
+  if (!cartEl._glActive) return cartEl.audio.currentTime;
+  const ctx = getAudioCtx();
+  const { ls, ll } = _glBounds(cartEl);
+  const elapsed = ctx.currentTime - cartEl._glStartCtxTime;
+  return ls + (elapsed % ll);
+}
+
+/**
+ * Démarre (ou reprend) la boucle gapless sur un cart.
+ * Retourne false si le buffer n'est pas encore prêt (fallback natif).
+ */
+function startGaplessLoop(cartEl) {
+  const buf = cartEl.audioBuffer;
+  if (!buf) return false;
+
+  const ctx = getAudioCtx();
+  const { ls, le } = _glBounds(cartEl);
+
+  // Crée le GainNode et le connecte directement à la sortie (une seule fois)
+  if (!cartEl._glGain) {
+    cartEl._glGain = ctx.createGain();
+    cartEl._glGain.connect(ctx.destination);
+    // Routage vers le périphérique de sortie sélectionné (Chrome 110+)
+    if (selectedOutputDeviceId && selectedOutputDeviceId !== 'default'
+        && typeof ctx.setSinkId === 'function') {
+      ctx.setSinkId(selectedOutputDeviceId).catch(() => {});
+    }
+  }
+
+  cartEl._glGain.gain.cancelScheduledValues(ctx.currentTime);
+  cartEl._glGain.gain.setValueAtTime(getCartVolume(cartEl), ctx.currentTime);
+
+  // Crée un nouveau nœud source
+  const src = ctx.createBufferSource();
+  src.buffer    = buf;
+  src.loop      = true;
+  src.loopStart = ls;
+  src.loopEnd   = le;
+  src.connect(cartEl._glGain);
+
+  const offset       = (cartEl._glOffset !== undefined) ? cartEl._glOffset : ls;
+  const ctxNow       = ctx.currentTime;
+  src.start(ctxNow, offset);
+
+  cartEl._glSource       = src;
+  cartEl._glStartCtxTime = ctxNow;
+  cartEl._glActive       = true;
+  return true;
+}
+
+/** Mets la boucle gapless en pause (mémorise la position). */
+function pauseGaplessLoop(cartEl) {
+  if (!cartEl._glActive) return;
+  cartEl._glOffset = glCurrentTime(cartEl);
+  try { cartEl._glSource.stop(); } catch (_) {}
+  cartEl._glSource.disconnect();
+  cartEl._glSource = null;
+  cartEl._glActive = false;
+}
+
+/** Arrête la boucle gapless et remet la position au cue-in. */
+function stopGaplessLoop(cartEl) {
+  if (cartEl._glSource) {
+    try { cartEl._glSource.stop(); } catch (_) {}
+    cartEl._glSource.disconnect();
+    cartEl._glSource = null;
+  }
+  const { ls } = _glBounds(cartEl);
+  cartEl._glOffset = ls;
+  cartEl._glActive = false;
+}
+
+/** Fade-out du GainNode gapless sur FADE_MS ms, puis appelle cb. */
+function fadeOutGaplessLoop(cartEl, cb) {
+  const ctx = getAudioCtx();
+  const g   = cartEl._glGain.gain;
+  g.cancelScheduledValues(ctx.currentTime);
+  g.setValueAtTime(g.value, ctx.currentTime);
+  g.linearRampToValueAtTime(0, ctx.currentTime + FADE_MS / 1000);
+  setTimeout(cb, FADE_MS);
+}
+
+/* ---------------------------------------------------------------
+   3b. FADE OUT  (éléments HTMLAudioElement natifs)
+   --------------------------------------------------------------- */
 
 /**
  * Fade audio element out over `ms` milliseconds, then call `cb`.
@@ -131,45 +229,104 @@ function fadeOut(el, ms = FADE_MS, cb) {
   }, 50);
 }
 
+/* ---------------------------------------------------------------
+   3c. VOLUME PAR CARTOUCHE
+   --------------------------------------------------------------- */
+
+/**
+ * Retourne le volume utilisateur (0-1) d'une cartouche (1 par défaut).
+ * @param {HTMLElement} cartEl
+ * @returns {number}
+ */
+function getCartVolume(cartEl) {
+  return (typeof cartEl.userVolume === 'number') ? cartEl.userVolume : 1;
+}
+
+/**
+ * Définit le volume utilisateur d'une cartouche et l'applique en direct
+ * (élément audio natif ou boucle gapless) si elle est en lecture.
+ * @param {HTMLElement} cartEl
+ * @param {number} vol  Volume cible (0-1)
+ */
+function setCartVolume(cartEl, vol) {
+  vol = Math.max(0, Math.min(1, vol));
+  cartEl.userVolume = vol;
+  // Application en direct sur le chemin audio actif
+  if (cartEl._glActive && cartEl._glGain) {
+    const ctx = getAudioCtx();
+    cartEl._glGain.gain.cancelScheduledValues(ctx.currentTime);
+    cartEl._glGain.gain.setValueAtTime(vol, ctx.currentTime);
+  } else if (!cartEl.audio.paused) {
+    cartEl.audio.volume = vol;
+  }
+  scheduleAutoSave();
+}
+
 /**
  * Play, pause or reset a cart on click.
  * @param {HTMLElement} cartEl
  */
 function playPauseOrReset(cartEl) {
-  const audio = cartEl.audio;
-  const mixMode = document.getElementById('mixMode').checked;
+  const audio      = cartEl.audio;
+  const mixMode    = document.getElementById('mixMode').checked;
   const resetOn2nd = document.getElementById('secondModeCheckbox').checked;
+  const isPlaying  = !audio.paused || cartEl._glActive;
 
-  if (audio.paused) {
+  if (!isPlaying) {
+    // === DÉMARRAGE ===
     if (!mixMode) stopAllExcept(cartEl);
-    // Apply CUT-IN: jump to cueIn if we're before it (fresh start or post-reset)
-    if (cartEl.cueIn !== null && audio.duration) {
-      const cueInTime = cartEl.cueIn * audio.duration;
-      if (audio.currentTime < cueInTime) audio.currentTime = cueInTime;
+    if (audio.loop && cartEl.audioBuffer) {
+      // Boucle gapless via Web Audio API
+      startGaplessLoop(cartEl);
+    } else {
+      // Lecture native HTMLAudioElement
+      if (cartEl.cueIn !== null && audio.duration) {
+        const cueInTime = cartEl.cueIn * audio.duration;
+        if (audio.currentTime < cueInTime) audio.currentTime = cueInTime;
+      }
+      audio.volume = getCartVolume(cartEl);
+      audio.play();
     }
-    fadeIn(audio);
-    audio.play();
     cartEl.classList.add('playing');
     trackProgress(cartEl);
     broadcastCartAction(cartEl.dataset.idx, 'play');
   } else if (resetOn2nd) {
+    // === STOP / RESET ===
     broadcastCartAction(cartEl.dataset.idx, 'stop');
-    fadeOut(audio, FADE_MS, () => {
-      audio.pause();
-      const dur = audio.duration || 0;
-      audio.currentTime = (cartEl.cueIn !== null && dur) ? cartEl.cueIn * dur : 0;
-      cartEl.classList.remove('playing', 'blinking');
-      restoreCartLED(cartEl);
-      resetProgress(cartEl);
-      // Broadcast final reset state
-      broadcastState(cartEl.dataset.idx, false, 0, cartEl.querySelector('.time').textContent, cartEl.style.background || '');
-    });
+    if (cartEl._glActive) {
+      fadeOutGaplessLoop(cartEl, () => {
+        stopGaplessLoop(cartEl);
+        cartEl.classList.remove('playing', 'blinking');
+        restoreCartLED(cartEl);
+        resetProgress(cartEl);
+        broadcastState(cartEl.dataset.idx, false, 0, cartEl.querySelector('.time').textContent, cartEl.style.background || '');
+      });
+    } else {
+      fadeOut(audio, FADE_MS, () => {
+        audio.pause();
+        const dur = audio.duration || 0;
+        audio.currentTime = (cartEl.cueIn !== null && dur) ? cartEl.cueIn * dur : 0;
+        cartEl.classList.remove('playing', 'blinking');
+        restoreCartLED(cartEl);
+        resetProgress(cartEl);
+        broadcastState(cartEl.dataset.idx, false, 0, cartEl.querySelector('.time').textContent, cartEl.style.background || '');
+      });
+    }
   } else {
-    fadeOut(audio, FADE_MS, () => {
-      audio.pause();
-      cartEl.classList.remove('playing', 'blinking');
-      restoreCartLED(cartEl);
-    });
+    // === PAUSE ===
+    if (cartEl._glActive) {
+      fadeOutGaplessLoop(cartEl, () => {
+        pauseGaplessLoop(cartEl);
+        cartEl.classList.remove('playing', 'blinking');
+        restoreCartLED(cartEl);
+      });
+    } else {
+      fadeOut(audio, FADE_MS, () => {
+        audio.pause();
+        cartEl.classList.remove('playing', 'blinking');
+        restoreCartLED(cartEl);
+      });
+    }
     broadcastCartAction(cartEl.dataset.idx, 'pause');
   }
 }
@@ -182,16 +339,25 @@ function stopAllExcept(except) {
   const resetOn2nd = document.getElementById('secondModeCheckbox').checked;
   document.querySelectorAll('.cart.playing').forEach(c => {
     if (c !== except) {
-      fadeOut(c.audio, FADE_MS, () => {
-        c.audio.pause();
-        if (resetOn2nd) {
-          const dur2 = c.audio.duration || 0;
-          c.audio.currentTime = (c.cueIn !== null && dur2) ? c.cueIn * dur2 : 0;
-          resetProgress(c);
-        }
-        c.classList.remove('playing', 'blinking');
-        restoreCartLED(c);
-      });
+      if (c._glActive) {
+        fadeOutGaplessLoop(c, () => {
+          if (resetOn2nd) { stopGaplessLoop(c); resetProgress(c); }
+          else pauseGaplessLoop(c);
+          c.classList.remove('playing', 'blinking');
+          restoreCartLED(c);
+        });
+      } else {
+        fadeOut(c.audio, FADE_MS, () => {
+          c.audio.pause();
+          if (resetOn2nd) {
+            const dur2 = c.audio.duration || 0;
+            c.audio.currentTime = (c.cueIn !== null && dur2) ? c.cueIn * dur2 : 0;
+            resetProgress(c);
+          }
+          c.classList.remove('playing', 'blinking');
+          restoreCartLED(c);
+        });
+      }
     }
   });
 }
@@ -199,15 +365,25 @@ function stopAllExcept(except) {
 /** Stop and reset all playing carts. */
 function stopAll() {
   document.querySelectorAll('.cart.playing').forEach(c => {
-    const dur = c.audio.duration || 0;
-    fadeOut(c.audio, FADE_MS, () => {
-      c.audio.pause();
-      c.audio.currentTime = (c.cueIn !== null && dur) ? c.cueIn * dur : 0;
-      c.classList.remove('playing', 'blinking');
-      restoreCartLED(c);
-      resetProgress(c);
-      broadcastState(+c.dataset.idx, false, 0, c.querySelector('.time').textContent, c.style.background || '');
-    });
+    if (c._glActive) {
+      fadeOutGaplessLoop(c, () => {
+        stopGaplessLoop(c);
+        c.classList.remove('playing', 'blinking');
+        restoreCartLED(c);
+        resetProgress(c);
+        broadcastState(+c.dataset.idx, false, 0, c.querySelector('.time').textContent, c.style.background || '');
+      });
+    } else {
+      const dur = c.audio.duration || 0;
+      fadeOut(c.audio, FADE_MS, () => {
+        c.audio.pause();
+        c.audio.currentTime = (c.cueIn !== null && dur) ? c.cueIn * dur : 0;
+        c.classList.remove('playing', 'blinking');
+        restoreCartLED(c);
+        resetProgress(c);
+        broadcastState(+c.dataset.idx, false, 0, c.querySelector('.time').textContent, c.style.background || '');
+      });
+    }
   });
   broadcastCartAction(-1, 'stopAll');
 }
@@ -224,20 +400,25 @@ function trackProgress(cartEl) {
   let ledBlinkState = null; // null=static, true=LED on, false=LED off
 
   function tick() {
-    if (audio.paused) return;
-    const dur = audio.duration || 0;
+    // En mode gapless, audio.paused est toujours true → on vérifie _glActive
+    if (!cartEl._glActive && audio.paused) return;
+    const dur = cartEl._glActive
+      ? (cartEl.audioBuffer ? cartEl.audioBuffer.duration : (audio.duration || 0))
+      : (audio.duration || 0);
+    const currentTime = cartEl._glActive ? glCurrentTime(cartEl) : audio.currentTime;
     if (dur) {
       const cueInTime  = (cartEl.cueIn  !== null) ? cartEl.cueIn  * dur : 0;
       const cueOutTime = (cartEl.cueOut !== null) ? cartEl.cueOut * dur : dur;
       const rangeLen   = Math.max(0.001, cueOutTime - cueInTime);
-      const rem        = Math.max(0, cueOutTime - audio.currentTime);
+      const rem        = Math.max(0, cueOutTime - currentTime);
       const pct        = Math.max(0, Math.min(100,
-        (audio.currentTime - cueInTime) / rangeLen * 100
+        (currentTime - cueInTime) / rangeLen * 100
       )).toFixed(2);
       progEl.style.width = pct + '%';
       const timeText = '-' + formatTime(rem);
       timeEl.textContent = timeText;
-      const shouldBlink = rem <= 5;
+      // Pas de clignotement en boucle gapless (rem se remet à zéro à chaque cycle)
+      const shouldBlink = !cartEl._glActive && rem <= 5;
       cartEl.classList.toggle('blinking', shouldBlink);
 
       // Mirror blink to Launchpad LED
@@ -331,10 +512,14 @@ function assignFile(cartEl, file) {
   if (selectedOutputDeviceId && 'setSinkId' in HTMLAudioElement.prototype) {
     cartEl.audio.setSinkId(selectedOutputDeviceId).catch(() => {});
   }
-  // Invalidate cached waveform and regenerate asynchronously
-  cartEl.waveformData = null;
-  generateWaveform(file).then(wf => {
-    if (cartEl.file === file) cartEl.waveformData = wf;
+  // Invalidate cached waveform/buffer and regenerate asynchronously
+  cartEl.waveformData  = null;
+  cartEl.audioBuffer   = null;
+  generateWaveform(file).then(({ waveform, audioBuffer }) => {
+    if (cartEl.file === file) {
+      cartEl.waveformData = waveform;
+      cartEl.audioBuffer  = audioBuffer;
+    }
   });
   cartEl.audio.onloadedmetadata = () => {
     const name = file.name.replace(/\.[^.]+$/, ''); // strip extension
@@ -356,6 +541,13 @@ function assignFile(cartEl, file) {
  * @param {HTMLElement} cartEl
  */
 function clearCart(cartEl) {
+  // Arrêt de la boucle gapless si active
+  if (cartEl._glActive) stopGaplessLoop(cartEl);
+  if (cartEl._glSource) { try { cartEl._glSource.stop(); } catch(_) {} cartEl._glSource = null; }
+  if (cartEl._glGain)   { cartEl._glGain.disconnect(); cartEl._glGain = null; }
+  cartEl._glOffset = undefined;
+  cartEl.audioBuffer = null;
+
   if (cartEl.objectURL) URL.revokeObjectURL(cartEl.objectURL);
   delete cartEl.file;
   cartEl.audio.pause();
@@ -364,6 +556,7 @@ function clearCart(cartEl) {
   cartEl.waveformData = null;
   cartEl.cueIn  = null;
   cartEl.cueOut = null;
+  cartEl.userVolume = 1;
   cartEl.classList.remove('playing', 'blinking', 'loop');
   cartEl.classList.add('empty');
   const idx = +cartEl.dataset.idx;
@@ -400,12 +593,22 @@ function buildContextMenu(cartEl) {
     const sw = document.createElement('div');
     sw.className = 'swatch';
     sw.style.background = hex;
-    sw.title = hex;
+    // The browser normalises both values to the same rgb() form → reliable compare
+    const isActive = !!(cartEl && cartEl.style.background &&
+                        cartEl.style.background === sw.style.background);
+    if (isActive) sw.classList.add('active');
+    sw.title = isActive ? `${hex} — cliquer pour retirer` : hex;
     sw.onclick = () => {
       if (cartEl) {
-        cartEl.style.background = hex;
+        if (cartEl.style.background === sw.style.background) {
+          // Re-click on the active colour → revert to base colour
+          cartEl.style.background = '';
+          if (cartEl.midiNote) setLaunchpadLED(cartEl.midiNote.note, '#ffffff');
+        } else {
+          cartEl.style.background = hex;
+          if (cartEl.midiNote) setLaunchpadLED(cartEl.midiNote.note, hex);
+        }
         broadcastCartMeta(cartEl); // sync color change live
-        if (cartEl.midiNote) setLaunchpadLED(cartEl.midiNote.note, hex);
         scheduleAutoSave();
       }
       hideCtxMenu();
@@ -413,6 +616,23 @@ function buildContextMenu(cartEl) {
     swatchRow.appendChild(sw);
   });
   menu.appendChild(swatchRow);
+
+  // Volume slider
+  const volRow = document.createElement('div');
+  volRow.className = 'ctx-volume';
+  const volPct = Math.round(getCartVolume(cartEl) * 100);
+  volRow.innerHTML = `
+    <span class="ctx-volume-ico">🔊</span>
+    <input class="ctx-volume-slider" type="range" min="0" max="100" value="${volPct}"
+           aria-label="Volume de la cartouche" />
+    <span class="ctx-volume-val">${volPct}%</span>`;
+  const volSlider = volRow.querySelector('.ctx-volume-slider');
+  const volVal    = volRow.querySelector('.ctx-volume-val');
+  volSlider.oninput = () => {
+    if (cartEl) setCartVolume(cartEl, +volSlider.value / 100);
+    volVal.textContent = `${volSlider.value}%`;
+  };
+  menu.appendChild(volRow);
 
   // Add file button
   const btnFile = document.createElement('button');
@@ -456,8 +676,20 @@ function buildContextMenu(cartEl) {
   if (isLoop) btnLoop.classList.add('active');
   btnLoop.onclick = () => {
     if (cartEl) {
+      const wasGapless = cartEl._glActive;
       cartEl.audio.loop = !cartEl.audio.loop;
       cartEl.classList.toggle('loop', cartEl.audio.loop);
+
+      // Si on désactive la boucle pendant une lecture gapless, bascule en natif
+      if (wasGapless && !cartEl.audio.loop) {
+        const pos = glCurrentTime(cartEl);
+        fadeOutGaplessLoop(cartEl, () => {
+          stopGaplessLoop(cartEl);
+          if (cartEl.audio.duration) cartEl.audio.currentTime = pos;
+          cartEl.audio.volume = getCartVolume(cartEl);
+          cartEl.audio.play();
+        });
+      }
       scheduleAutoSave();
     }
     hideCtxMenu();
@@ -585,6 +817,7 @@ async function saveConfig() {
       midiNote: c.midiNote || null,
       cueIn:  c.cueIn  ?? null,
       cueOut: c.cueOut ?? null,
+      volume: c.userVolume ?? 1,
       dataUrl,
     });
   }
@@ -627,6 +860,7 @@ function loadConfig(e) {
         if (cfg.midiNote) { el.midiNote = cfg.midiNote; } else { delete el.midiNote; }
         el.cueIn  = cfg.cueIn  ?? null;
         el.cueOut = cfg.cueOut ?? null;
+        el.userVolume = cfg.volume ?? 1;
         updateShortcutBadge(el);
         updateCueBadge(el);
       }
@@ -665,6 +899,7 @@ async function autoSave() {
     midiNote:   c.midiNote  || null,
     cueIn:      c.cueIn     ?? null,
     cueOut:     c.cueOut    ?? null,
+    volume:     c.userVolume ?? 1,
     file:       c.file      || null,  // File extends Blob — stored natively
     fileName:   c.file ? c.file.name : null,
     fileType:   c.file ? c.file.type : null,
@@ -716,6 +951,7 @@ async function autoLoad() {
     el.querySelector('.label').textContent = cfg.label || `Cartouche ${i + 1}`;
     el.cueIn  = cfg.cueIn  ?? null;
     el.cueOut = cfg.cueOut ?? null;
+    el.userVolume = cfg.volume ?? 1;
     if (cfg.file) {
       const f = new File([cfg.file], cfg.fileName || 'audio', { type: cfg.fileType || '' });
       assignFile(el, f);
@@ -1475,9 +1711,9 @@ async function startMidiCapture(cartEl) {
 async function generateWaveform(file, samples = 700) {
   try {
     const arrayBuffer = await file.arrayBuffer();
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    audioCtx.close();
+    const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+    tempCtx.close();
     const rawData = audioBuffer.getChannelData(0);
     const blockSize = Math.floor(rawData.length / samples);
     const data = new Float32Array(samples);
@@ -1487,10 +1723,11 @@ async function generateWaveform(file, samples = 700) {
       data[i] = sum / blockSize;
     }
     const max = Math.max(...data);
-    return max > 0 ? data.map(v => v / max) : data;
+    const waveform = max > 0 ? data.map(v => v / max) : data;
+    return { waveform, audioBuffer };
   } catch (e) {
     console.warn('[CUE] Waveform generation failed', e);
-    return null;
+    return { waveform: null, audioBuffer: null };
   }
 }
 
@@ -1809,8 +2046,11 @@ function openCueModal(cartEl) {
   if (cartEl.waveformData) {
     loadingEl.style.display = 'none';
   } else if (cartEl.file) {
-    generateWaveform(cartEl.file).then(wf => {
-      if (cartEl.file) cartEl.waveformData = wf; // guard against cart cleared
+    generateWaveform(cartEl.file).then(({ waveform, audioBuffer }) => {
+      if (cartEl.file) {
+        cartEl.waveformData = waveform; // guard against cart cleared
+        if (!cartEl.audioBuffer) cartEl.audioBuffer = audioBuffer;
+      }
       if (overlay.isConnected) { loadingEl.style.display = 'none'; redraw(); }
     });
   } else {
@@ -1880,6 +2120,10 @@ async function applyOutputDevice(deviceId, label) {
   document.querySelectorAll('.cart').forEach(cart => {
     if (cart.audio) promises.push(cart.audio.setSinkId(deviceId).catch(() => {}));
   });
+  // Routage du contexte Web Audio (gapless loop) — Chrome 110+
+  if (_sharedAudioCtx && typeof _sharedAudioCtx.setSinkId === 'function') {
+    promises.push(_sharedAudioCtx.setSinkId(deviceId).catch(() => {}));
+  }
   await Promise.all(promises);
   // Met à jour le libellé du bouton
   const btn = document.getElementById('audioOutputBtn');
@@ -2029,6 +2273,9 @@ document.addEventListener('DOMContentLoaded', () => {
       <div class="time"></div>
       <div class="progress"></div>
     `;
+
+    // Per-cart user volume (0-1)
+    cart.userVolume = 1;
 
     // Audio element
     cart.audio = new Audio();

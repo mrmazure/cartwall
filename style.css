@@ -349,16 +349,29 @@ header {
   line-height: 1;
 }
 
-/* ── Progress bar ─────────────────────────────────────────── */
+/* ── Progress bar (remplissage pleine hauteur) ────────────── */
 .cart .progress {
   position: absolute;
+  top: 0;
   bottom: 0;
   left: 0;
-  height: var(--progress-h);
-  background: var(--accent);
   width: 0%;
+  background: rgba(99, 102, 241, 0.32);
   transition: width 0.1s linear;
-  border-radius: 0 0 4px 4px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Liseré clair = tête de lecture, visible uniquement en lecture */
+.cart.playing .progress {
+  border-right: 2px solid rgba(129, 140, 248, 0.95);
+}
+
+/* Texte au-dessus du remplissage */
+.cart .label,
+.cart .time {
+  position: relative;
+  z-index: 1;
 }
 
 /* ── Cart loop dot ────────────────────────────────────────── */
@@ -417,6 +430,82 @@ header {
 .swatch:hover {
   transform: scale(1.2);
   border-color: #fff6;
+}
+
+/* Pastille de couleur actuellement appliquée (re-cliquer pour la retirer) */
+.swatch.active {
+  border-color: #fff;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* ── Context menu volume slider ───────────────────────────── */
+.ctx-volume {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  margin-top: 0.2rem;
+  background: var(--bg-cart);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ctx-volume-ico {
+  flex-shrink: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.ctx-volume-val {
+  flex-shrink: 0;
+  min-width: 36px;
+  text-align: right;
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--txt-muted);
+}
+
+.ctx-volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  height: 4px;
+  margin: 0;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
+  outline: none;
+  cursor: pointer;
+}
+
+.ctx-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+
+.ctx-volume-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+
+.ctx-volume-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
 }
 
 #ctxMenu button {
