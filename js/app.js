@@ -403,8 +403,8 @@ function trackProgress(cartEl) {
     // En mode gapless, audio.paused est toujours true → on vérifie _glActive
     if (!cartEl._glActive && audio.paused) return;
     const dur = cartEl._glActive
-      ? (cartEl.audioBuffer ? cartEl.audioBuffer.duration : (audio.duration || 0))
-      : (audio.duration || 0);
+      ? (cartEl.audioBuffer ? cartEl.audioBuffer.duration : getCartDuration(cartEl))
+      : getCartDuration(cartEl);
     const currentTime = cartEl._glActive ? glCurrentTime(cartEl) : audio.currentTime;
     if (dur) {
       const cueInTime  = (cartEl.cueIn  !== null) ? cartEl.cueIn  * dur : 0;
@@ -462,21 +462,41 @@ function restoreCartLED(cart) {
 }
 
 /**
+ * Durée effective d'un cart, en secondes.
+ * `audio.duration` peut rester NaN tant que 'loadedmetadata' n'a pas été
+ * déclenché : on retombe alors sur le buffer décodé par generateWaveform().
+ * @param {HTMLElement} cartEl
+ * @returns {number} 0 si aucune durée n'est encore connue
+ */
+function getCartDuration(cartEl) {
+  const d = cartEl.audio ? cartEl.audio.duration : NaN;
+  if (isFinite(d) && d > 0) return d;
+  const buf = cartEl.audioBuffer;
+  return (buf && isFinite(buf.duration)) ? buf.duration : 0;
+}
+
+/**
+ * (Ré)affiche la durée — ou celle du segment cue — sur un cart à l'arrêt.
+ * @param {HTMLElement} cartEl
+ */
+function refreshCartTime(cartEl) {
+  const timeEl = cartEl.querySelector('.time');
+  const dur = getCartDuration(cartEl);
+  if (!dur) { timeEl.textContent = ''; return; }
+  const inP  = cartEl.cueIn  ?? 0;
+  const outP = cartEl.cueOut ?? 1;
+  const displayDur = (cartEl.cueIn !== null || cartEl.cueOut !== null)
+    ? (outP - inP) * dur : dur;
+  timeEl.textContent = formatTime(Math.max(0, displayDur));
+}
+
+/**
  * Reset progress bar and time display of a cart.
  * @param {HTMLElement} cartEl
  */
 function resetProgress(cartEl) {
   cartEl.querySelector('.progress').style.width = '0%';
-  const dur = cartEl.audio.duration || 0;
-  if (dur) {
-    const inP  = cartEl.cueIn  ?? 0;
-    const outP = cartEl.cueOut ?? 1;
-    const displayDur = (cartEl.cueIn !== null || cartEl.cueOut !== null)
-      ? (outP - inP) * dur : dur;
-    cartEl.querySelector('.time').textContent = formatTime(Math.max(0, displayDur));
-  } else {
-    cartEl.querySelector('.time').textContent = '';
-  }
+  refreshCartTime(cartEl);
 }
 
 /* =============================================================
@@ -501,39 +521,48 @@ function pickFile(cb) {
  * Assign an audio file to a cart element.
  * @param {HTMLElement} cartEl
  * @param {File} file
+ * @param {boolean} [keepLabel=false] Conserve le libellé actuel (restauration
+ *        d'une config : le nom personnalisé prime sur le nom de fichier).
  */
-function assignFile(cartEl, file) {
+function assignFile(cartEl, file, keepLabel = false) {
   cartEl.file = file;
   cartEl.classList.remove('empty');
   if (cartEl.objectURL) URL.revokeObjectURL(cartEl.objectURL);
   cartEl.objectURL = URL.createObjectURL(file);
-  cartEl.audio.src = cartEl.objectURL;
-  // Applique la sortie audio sélectionnée au nouvel élément
-  if (selectedOutputDeviceId && 'setSinkId' in HTMLAudioElement.prototype) {
-    cartEl.audio.setSinkId(selectedOutputDeviceId).catch(() => {});
+
+  // Libellé et persistance immédiats : ils ne doivent pas dépendre de
+  // 'loadedmetadata', qui peut tarder — voire ne jamais arriver — au premier
+  // chargement de la page.
+  if (!keepLabel) {
+    cartEl.querySelector('.label').textContent = file.name.replace(/\.[^.]+$/, '');
   }
+
   // Invalidate cached waveform/buffer and regenerate asynchronously
   cartEl.waveformData  = null;
   cartEl.audioBuffer   = null;
+
+  // Applique la sortie audio sélectionnée AVANT de lancer le chargement, pour
+  // ne pas interrompre la sélection de ressource de l'élément audio.
+  if (selectedOutputDeviceId && 'setSinkId' in HTMLAudioElement.prototype) {
+    cartEl.audio.setSinkId(selectedOutputDeviceId).catch(() => {});
+  }
+  cartEl.audio.src = cartEl.objectURL;
+  cartEl.audio.load();      // force la lecture des métadonnées (durée)
+
+  refreshCartTime(cartEl);  // efface l'affichage précédent en attendant
+
   generateWaveform(file).then(({ waveform, audioBuffer }) => {
-    if (cartEl.file === file) {
-      cartEl.waveformData = waveform;
-      cartEl.audioBuffer  = audioBuffer;
-    }
+    if (cartEl.file !== file) return;
+    cartEl.waveformData = waveform;
+    cartEl.audioBuffer  = audioBuffer;
+    // Filet de sécurité : si 'loadedmetadata' n'a pas encore fourni de durée,
+    // on affiche celle du buffer décodé.
+    if (cartEl.audio.paused && !cartEl._glActive) refreshCartTime(cartEl);
+    broadcastCartMeta(cartEl);
   });
-  cartEl.audio.onloadedmetadata = () => {
-    const name = file.name.replace(/\.[^.]+$/, ''); // strip extension
-    cartEl.querySelector('.label').textContent = name;
-    // Show cue-range duration if cue points are already set (e.g. loaded from config)
-    const dur = cartEl.audio.duration;
-    const inP  = cartEl.cueIn  ?? 0;
-    const outP = cartEl.cueOut ?? 1;
-    const displayDur = (cartEl.cueIn !== null || cartEl.cueOut !== null)
-      ? (outP - inP) * dur : dur;
-    cartEl.querySelector('.time').textContent = formatTime(Math.max(0, displayDur));
-    broadcastCartMeta(cartEl); // sync label, color, duration to slaves
-    scheduleAutoSave();
-  };
+
+  broadcastCartMeta(cartEl); // sync label, color, duration to slaves
+  scheduleAutoSave();
 }
 
 /**
@@ -849,7 +878,7 @@ function loadConfig(e) {
         if (cfg.dataUrl) {
           const blob = dataURLtoBlob(cfg.dataUrl);
           const f = new File([blob], cfg.label, { type: blob.type });
-          assignFile(el, f);
+          assignFile(el, f, true); // le libellé vient déjà de la config
         } else {
           clearCart(el);
           el.querySelector('.label').textContent = cfg.label || `Cartouche ${i + 1}`;
@@ -861,6 +890,7 @@ function loadConfig(e) {
         el.cueIn  = cfg.cueIn  ?? null;
         el.cueOut = cfg.cueOut ?? null;
         el.userVolume = cfg.volume ?? 1;
+        refreshCartTime(el); // les cue points viennent d'être appliqués
         updateShortcutBadge(el);
         updateCueBadge(el);
       }
@@ -954,7 +984,7 @@ async function autoLoad() {
     el.userVolume = cfg.volume ?? 1;
     if (cfg.file) {
       const f = new File([cfg.file], cfg.fileName || 'audio', { type: cfg.fileType || '' });
-      assignFile(el, f);
+      assignFile(el, f, true); // le libellé vient déjà de la config
     }
     el.audio.loop = !!cfg.loop;
     el.classList.toggle('loop', !!cfg.loop);
@@ -1023,7 +1053,7 @@ function applyPaletteSnapshot(snapshot) {
  */
 function broadcastCartMeta(cartEl) {
   if (!isHost || clientConns.length === 0) return;
-  const dur = cartEl.audio.duration || 0;
+  const dur = getCartDuration(cartEl);
   const msg = {
     type: 'cartMeta',
     idx: +cartEl.dataset.idx,
@@ -2280,6 +2310,16 @@ document.addEventListener('DOMContentLoaded', () => {
     // Audio element
     cart.audio = new Audio();
     cart.audio.preload = 'auto';
+
+    // Durée : 'loadedmetadata' peut arriver bien après assignFile(). Ces
+    // écouteurs, posés une fois pour toutes, rafraîchissent l'affichage dès que
+    // la durée devient connue.
+    ['loadedmetadata', 'durationchange'].forEach(ev =>
+      cart.audio.addEventListener(ev, () => {
+        if (cart.audio.paused && !cart._glActive) refreshCartTime(cart);
+        broadcastCartMeta(cart);
+      })
+    );
 
     // Precise CUT-OUT enforcement via timeupdate (fires even in background)
     cart.audio.addEventListener('timeupdate', () => {
